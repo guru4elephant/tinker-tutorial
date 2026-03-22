@@ -20,12 +20,14 @@ Thinking Machines Tinker 是由 Thinking Machines Lab（Mira Murati & John Schul
 ### 调研报告
 
 - [全面调研报告](docs/research-report.md) — 架构原理、核心 API、与其他平台对比、完整使用教程
+- [On-Policy Distillation 调研](docs/on-policy-distillation.md) — 在策略蒸馏原理、逆向 KL 散度、Cookbook 实战
 
 ### 示例代码
 
 - [文本分类 (情感分析)](examples/text_classification.py) — 用 LLM + SFT 实现文本分类
 - [监督微调 (SFT)](examples/sft_training.py) — 基础 SFT 训练循环
 - [强化学习 (RL)](examples/rl_training.py) — Policy Gradient + 自定义奖励函数
+- [On-Policy Distillation](examples/on_policy_distillation.py) — 大模型蒸馏到小模型（逆向 KL 散度）
 
 ## 快速开始
 
@@ -91,6 +93,7 @@ print(response)
 | 对齐训练 | RLHF (SFT → RM → PPO) |
 | 工具调用 | 函数调用格式训练 |
 | 模型蒸馏 | 大模型行为蒸馏到小模型 |
+| On-Policy Distillation | 学生 on-policy 采样 + 教师 KL 监督（FLOPs 降低 9-30x） |
 
 ## 参考资源
 
@@ -98,3 +101,4 @@ print(response)
 - [Tinker 文档](https://tinker-docs.thinkingmachines.ai/)
 - [Tinker SDK GitHub](https://github.com/thinking-machines-lab/tinker)
 - [Tinker Cookbook GitHub](https://github.com/thinking-machines-lab/tinker-cookbook)
+- [On-Policy Distillation Blog](https://thinkingmachines.ai/blog/on-policy-distillation/)
