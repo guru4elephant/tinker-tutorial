@@ -21,6 +21,7 @@ Thinking Machines Tinker 是由 Thinking Machines Lab（Mira Murati & John Schul
 
 - [全面调研报告](docs/research-report.md) — 架构原理、核心 API、与其他平台对比、完整使用教程
 - [On-Policy Distillation 调研](docs/on-policy-distillation.md) — 在策略蒸馏原理、逆向 KL 散度、Cookbook 实战
+- [Agentic RL 多轮工具调用](docs/agentic-rl-tool-use.md) — Env 接口、多轮训练、GRPO、Cookbook 实战案例
 
 ### 示例代码
 
@@ -28,6 +29,7 @@ Thinking Machines Tinker 是由 Thinking Machines Lab（Mira Murati & John Schul
 - [监督微调 (SFT)](examples/sft_training.py) — 基础 SFT 训练循环
 - [强化学习 (RL)](examples/rl_training.py) — Policy Gradient + 自定义奖励函数
 - [On-Policy Distillation](examples/on_policy_distillation.py) — 大模型蒸馏到小模型（逆向 KL 散度）
+- [Agentic RL 工具调用](examples/agentic_rl_tool_use.py) — 多轮 RL 训练 agent 使用工具（GRPO 风格）
 
 ## 快速开始
 
@@ -91,7 +93,7 @@ print(response)
 | 文本分类 | 情感分析、主题分类、意图识别 |
 | 数学推理增强 | RL 训练 + 正确性奖励 |
 | 对齐训练 | RLHF (SFT → RM → PPO) |
-| 工具调用 | 函数调用格式训练 |
+| Agentic RL 工具调用 | 多轮 RL 训练 agent 使用检索/计算/终端工具 |
 | 模型蒸馏 | 大模型行为蒸馏到小模型 |
 | On-Policy Distillation | 学生 on-policy 采样 + 教师 KL 监督（FLOPs 降低 9-30x） |
 
