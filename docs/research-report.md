@@ -1,354 +1,668 @@
-# Tinker SDK 全面调研报告
+# Thinking Machines Tinker SDK 全面调研报告
+
+> Mira Murati 团队推出的 LLM 分布式微调训练 API
 
 ## 1. 概述
 
 ### 1.1 什么是 Tinker？
 
-Tinker 是 **腾讯微信团队** 开源的 Android 热修复（Hot-Fix）框架，支持在不重新安装 APK 的情况下，动态更新应用的：
+Thinking Machines Tinker 是一个 **LLM 分布式微调训练 API**，由 Mira Murati（前 OpenAI CTO）和 John Schulman（前 OpenAI 联合创始人）共同创办的 Thinking Machines Lab 于 **2025 年 10 月** 推出。
 
-- **Dex 代码**（Java/Kotlin 类）
-- **Native 库**（.so 文件）
-- **应用资源**（layout、drawable、values 等）
-
-Tinker 已在 **微信** 数十亿设备上稳定运行，是目前 Android 平台最成熟、功能最全面的开源热修复方案之一。
+核心理念：在本地 CPU 机器上编写训练循环，Tinker 负责所有分布式 GPU 基础设施。Andrej Karpathy 评价其"保留约 90% 的算法控制权，同时消除约 90% 的基础设施痛点"。
 
 ### 1.2 项目信息
 
 | 属性 | 值 |
 |------|-----|
-| GitHub 地址 | https://github.com/Tencent/tinker |
-| Stars | 17.8k+ |
-| 开源协议 | BSD 3-Clause |
-| 最新版本 | v1.9.15.2 (2025年7月) |
-| 语言构成 | Java (92.8%)、Groovy (6.5%) |
-| 支持平台 | Android 2.X ~ 14+ |
+| 官网 | https://thinkingmachines.ai/tinker/ |
+| 文档 | https://tinker-docs.thinkingmachines.ai/ |
+| GitHub SDK | https://github.com/thinking-machines-lab/tinker |
+| Cookbook | https://github.com/thinking-machines-lab/tinker-cookbook |
+| 许可证 | Apache-2.0（Cookbook） |
+| 发布日期 | 2025 年 10 月 1 日 |
 
 ### 1.3 核心优势
 
-1. **全面修复能力**：同时支持代码、资源、So 库修复
-2. **补丁包小**：采用 DexDiff 算法，差量补丁体积极小
-3. **开发透明**：对业务代码无侵入，开发调试流程不受影响
-4. **Gradle 深度集成**：自动完成补丁构建、签名、ProGuard 适配
-5. **稳定可靠**：经过微信数十亿用户验证，兼容性极强
-6. **完全开源**：基础功能完全免费
+1. **极简 API**：仅 4 个核心原语覆盖所有训练需求
+2. **零基础设施管理**：不需要管理 GPU、NCCL、分布式策略
+3. **完整算法控制**：保留对训练循环、损失函数、优化器的完全控制
+4. **一行切换模型**：从 1B 到 397B，只需修改 `base_model` 字符串
+5. **LoRA 微调**：高效低秩适配，效果接近全参数微调
+6. **推理兼容**：训练后的模型暴露 OpenAI 兼容 HTTP 端点
 
 ---
 
 ## 2. 核心架构与原理
 
-### 2.1 整体架构
+### 2.1 设计哲学
+
+- **API-first**：所有训练在服务端执行，本地代码仅发送 API 调用
+- **仅 LoRA 微调**：使用低秩自适应（Low-Rank Adaptation），团队认为 LoRA 在大多数实际场景中与全参数微调效果相当
+- **四个核心原语**：API 表面极简，仅 `forward_backward`、`optim_step`、`save_state`、`sample`
+- **异步流水线**：操作可以异步排队，`forward_backward` 和 `optim_step` 可以流水线化执行
+
+### 2.2 架构图
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Tinker 架构                      │
-├─────────────────────────────────────────────────┤
-│                                                   │
-│  ┌──────────────┐  ┌──────────────┐              │
-│  │  Patch 生成   │  │  Patch 分发   │              │
-│  │  (编译时)     │  │  (服务端)     │              │
-│  └──────┬───────┘  └──────┬───────┘              │
-│         │                  │                      │
-│         ▼                  ▼                      │
-│  ┌──────────────────────────────────┐            │
-│  │         Patch 验证与合成          │            │
-│  │    (PatchListener + PatchService) │            │
-│  └──────────────┬───────────────────┘            │
-│                  │                                │
-│         ┌───────┼───────┐                        │
-│         ▼       ▼       ▼                        │
-│  ┌─────────┐ ┌─────┐ ┌──────┐                   │
-│  │ DexDiff │ │ BSP │ │ Res  │                    │
-│  │ 合成    │ │iff  │ │ 合成 │                    │
-│  │         │ │ So  │ │      │                    │
-│  └────┬────┘ └──┬──┘ └──┬───┘                   │
-│       │         │       │                        │
-│       ▼         ▼       ▼                        │
-│  ┌──────────────────────────────────┐            │
-│  │       TinkerLoader (加载)         │            │
-│  │  ClassLoader Hook + Resource Hook │            │
-│  └──────────────────────────────────┘            │
-│                                                   │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────┐
+│    你的本地机器 (CPU)      │
+│                          │
+│  ┌────────────────────┐  │
+│  │  训练循环代码        │  │
+│  │  (Python)           │  │
+│  └────────┬───────────┘  │
+│           │ API 调用      │
+└───────────┼──────────────┘
+            │
+            ▼
+┌──────────────────────────┐
+│  Thinking Machines Cloud  │
+│                          │
+│  ┌────────────────────┐  │
+│  │  Tinker API Server  │  │
+│  └────────┬───────────┘  │
+│           │              │
+│  ┌────────▼───────────┐  │
+│  │  分布式 GPU 集群     │  │
+│  │  (自动管理)          │  │
+│  └────────────────────┘  │
+│                          │
+│  ┌────────────────────┐  │
+│  │  模型权重存储        │  │
+│  │  (检查点管理)        │  │
+│  └────────────────────┘  │
+└──────────────────────────┘
 ```
 
-### 2.2 Dex 修复原理
+### 2.3 与传统训练方式对比
 
-Tinker 采用 **类加载方案 (ClassLoader)**，而非底层替换方案：
+| 特性 | 传统分布式训练 | Tinker API |
+|------|--------------|-----------|
+| GPU 管理 | 手动配置 | 自动 |
+| 并行策略 | 手动实现 (FSDP/DeepSpeed) | 自动 |
+| 代码复杂度 | 高（数千行） | 低（数十行） |
+| 调试难度 | 难（分布式调试） | 易（本地调试） |
+| 算法控制 | 完全控制 | ~90% 控制 |
+| 基础设施控制 | 完全控制 | 无（API 抽象） |
 
-#### 2.2.1 补丁生成（编译时）
+### 2.4 与其他微调平台对比
 
-1. 使用自研 **DexDiff** 算法对比新旧 APK 的 dex 文件
-2. 生成差量补丁（远小于完整 dex）
-3. DexDiff 基于 dex 文件格式进行字节级别的差量计算
+| 特性 | Tinker | AWS SageMaker | Modal | Together AI |
+|------|--------|---------------|-------|-------------|
+| **定位** | 研究者工具 | 工程师平台 | 通用计算 | 推理优先 |
+| **训练控制** | 高（自定义循环） | 中 | 高 | 低 |
+| **API 简洁度** | 极简（4 原语） | 复杂 | 中等 | 简单 |
+| **基础设施管理** | 零 | 需配置 | 需配置 | 零 |
+| **RL 训练支持** | 原生支持 | 需自建 | 需自建 | 不支持 |
+| **适合场景** | RL/对齐研究 | 生产 MLOps | 通用计算 | 推理服务 |
 
-```
-旧 APK (old.apk)  ─┐
-                     ├─ DexDiff ─→ patch.dex (差量补丁)
-新 APK (new.apk)  ─┘
-```
+---
 
-**DexDiff 内部实现：** `DexPatchGenerator` 是入口类，它为 DEX 文件的每个 Section 初始化独立的 Diff 算法：
+## 3. 安装与配置
 
-| Section Diff 算法 | 处理的 DEX Section |
-|---|---|
-| `StringDataSectionDiffAlgorithm` | 字符串常量池 |
-| `TypeIdSectionDiffAlgorithm` | 类型 ID 表 |
-| `ProtoIdSectionDiffAlgorithm` | 方法原型表 |
-| `FieldIdSectionDiffAlgorithm` | 字段 ID 表 |
-| `MethodIdSectionDiffAlgorithm` | 方法 ID 表 |
-| `ClassDefSectionDiffAlgorithm` | 类定义表 |
-| `TypeListSectionDiffAlgorithm` | 类型列表 |
-| `AnnotationSetSectionDiffAlgorithm` | 注解集 |
-| `ClassDataSectionDiffAlgorithm` | 类数据（字段/方法列表） |
-| `CodeSectionDiffAlgorithm` | 字节码指令 |
-| `DebugInfoItemSectionDiffAlgorithm` | 调试信息 |
+### 3.1 安装
 
-生成的补丁文件包含：MAGIC 头、版本号、各 Section 的操作列表（删除、新增、替换），每个操作记录目标索引和数据。
+```bash
+# 安装核心 SDK
+pip install tinker
 
-```java
-// DexDiff 使用示意
-DexPatchGenerator generator = new DexPatchGenerator(oldDexFile, newDexFile);
-generator.executeAndSaveTo(patchFile);
+# 安装 Cookbook（可选，包含示例和工具）
+pip install tinker-cookbook
 ```
 
-#### 2.2.2 补丁加载（运行时）
+### 3.2 认证配置
 
-补丁加载分为两个阶段：**合成阶段**（后台进程）和**加载阶段**（主进程重启后）。
+```python
+import tinker
 
-**合成阶段：**
-1. `TinkerInstaller.onReceiveUpgradePatch()` 触发补丁请求
-2. 请求经过 `PatchListener` 验证（签名、空间、版本等）
-3. 在独立的 `:patch` 进程中，`TinkerPatchService` 执行 DexPatch 合成
-4. 合成后的完整 dex 写入应用数据目录
-5. `ResultService` 回调通知合成结果
-
-**加载阶段（下次冷启动）：**
-1. `TinkerApplication.onCreate()` 最先执行
-2. `TinkerLoader.tryLoad()` 检查是否有已合成的补丁
-3. 使用 ClassLoader 注入机制加载合成后的 dex
-
-**Tinker 提供两种 ClassLoader 注入方式：**
-
-| 方式 | 类名 | 原理 | 适用场景 |
-|------|------|------|---------|
-| **方式 A（默认）** | `NewClassLoaderInjector` | 创建新的 `TinkerClassLoader`，通过反射替换 `LoadedApk.mClassLoader` | 新版本推荐 |
-| **方式 B（Legacy）** | `SystemClassLoaderAdder` | 反射修改现有 `PathClassLoader` 的 `dexElements` 数组 | 旧版本兼容 |
-
-```java
-// 方式 A 原理简化示意
-// 创建包含合成 dex 的新 ClassLoader
-TinkerClassLoader newLoader = new TinkerClassLoader(mergedDexPath, parent);
-// 反射替换 LoadedApk 的 mClassLoader
-LoadedApk loadedApk = getLoadedApk();
-Field classLoaderField = loadedApk.getClass().getDeclaredField("mClassLoader");
-classLoaderField.set(loadedApk, newLoader);
+# 创建服务客户端（需要 API Key）
+# API Key 通过环境变量 TINKER_API_KEY 或参数传入
+service_client = tinker.ServiceClient()
 ```
 
-> **注意**：Tinker 的类加载方案需要 **冷启动（重启应用）** 后才能生效，不支持即时生效。
+### 3.3 环境要求
 
-#### 2.2.3 崩溃保护机制
+- Python 3.8+
+- 无需 GPU（所有计算在云端执行）
+- 网络连接（API 调用需要互联网访问）
 
-Tinker 内置了崩溃保护，防止坏补丁导致应用无限崩溃：
+---
 
-1. 每次加载补丁后启动，Tinker 在 SharedPreferences 中递增崩溃计数器
-2. 如果应用在启动后 **10 秒内** 连续崩溃超过 **3 次**，判定为补丁导致的崩溃
-3. 自动 **回滚补丁**（`cleanPatch`），恢复到基线版本
-4. 成功运行超过阈值时间后，重置崩溃计数器
+## 4. 核心 API 详解
 
-#### 2.2.4 为什么选择类加载方案？
+### 4.1 四个核心原语
 
-| 特性 | 底层替换 (AndFix) | 类加载 (Tinker) |
-|------|-------------------|-----------------|
-| 即时生效 | ✅ | ❌ (需冷启动) |
-| 兼容性 | 差（依赖 ART 内部结构） | 好 |
-| 修复范围 | 仅方法替换 | 类级别替换 |
-| 稳定性 | 低 | 高 |
-| 新增类 | ❌ | ✅ |
+#### `forward_backward` — 前向传播 + 反向传播
 
-### 2.3 资源修复原理
+计算梯度并累积。
 
-Tinker 采用 **全量替换** 策略修复资源：
+```python
+# 创建训练客户端
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.2-1B",
+    rank=32,  # LoRA 秩
+)
 
-1. 编译时对比新旧 APK 的资源文件，生成资源补丁
-2. 运行时通过反射替换 `AssetManager`，加载新的资源包
-3. 大文件使用 **BSDiff** 算法生成差量补丁，减小补丁体积（默认阈值 100KB）
-
-```
-资源修复流程：
-1. 对比 resources.arsc → 生成差量
-2. 对比其他资源文件 → 新增/修改的资源打入补丁
-3. 运行时合成完整资源包
-4. 反射替换 AssetManager 指向新资源包
+# 执行前向传播和反向传播
+result = training_client.forward_backward(
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4"},
+    ],
+    loss="cross_entropy",  # 内置损失函数
+)
 ```
 
-### 2.4 So 库修复原理
+#### `optim_step` — 优化器步进
 
-Native 库修复采用 **替换加载** 策略：
+使用累积的梯度更新模型权重。
 
-1. 编译时使用 **BSDiff** 对比新旧 so 文件生成差量补丁
-2. 运行时合成新的 so 文件
-3. 通过两种方式加载：
-   - **反射注入方式**：将补丁 so 路径注入到 `nativeLibraryDirectories`
-   - **手动加载方式**：显式使用 `TinkerLoadLibrary.loadLibraryFromTinker()` 加载
-
-### 2.5 补丁文件结构
-
+```python
+training_client.optim_step(
+    learning_rate=1e-4,
+    beta1=0.9,
+    beta2=0.95,
+    eps=1e-8,
+)
 ```
-patch_signed.apk
-├── META-INF/          # 签名信息
-├── assets/
-│   ├── dex_meta.txt   # dex 补丁元数据
-│   ├── so_meta.txt    # so 补丁元数据
-│   ├── res_meta.txt   # 资源补丁元数据
-│   └── package_meta.txt # 补丁包元数据 (tinkerId 等)
-├── classes.dex        # dex 差量补丁
-├── lib/               # so 差量补丁
-│   └── armeabi-v7a/
-│       └── libxxx.so
-└── res/               # 资源补丁
-    └── resources.apk
+
+#### `save_state` / `load_state` — 状态管理
+
+保存和恢复训练状态（检查点）。
+
+```python
+# 保存检查点
+training_client.save_state("checkpoint_epoch_1")
+
+# 恢复检查点
+training_client.load_state("checkpoint_epoch_1")
+```
+
+#### `sample` — 推理采样
+
+使用训练好的模型进行推理。
+
+```python
+# 获取采样客户端
+sampling_client = training_client.save_weights_and_get_sampling_client(
+    name="my_fine_tuned_model"
+)
+
+# 生成响应
+response = sampling_client.sample(
+    messages=[{"role": "user", "content": "Hello!"}],
+    temperature=0.7,
+    max_tokens=256,
+)
+print(response)
+```
+
+### 4.2 内置损失函数
+
+| 损失函数 | 说明 | 适用场景 |
+|----------|------|---------|
+| `cross_entropy` | 标准交叉熵损失 | SFT 监督微调 |
+| `policy_gradient` | 策略梯度损失（需要 `reward` 参数） | RL 强化学习训练 |
+
+### 4.3 自定义损失函数
+
+当内置损失函数不够用时：
+
+```python
+# forward_backward_custom 允许任意可微损失函数
+# 代价是需要额外一次前向传播
+result = training_client.forward_backward_custom(
+    messages=messages,
+    custom_loss_fn=my_custom_loss,
+)
+```
+
+### 4.4 异步流水线模式
+
+高效训练的关键 — 让 `forward_backward` 和 `optim_step` 流水线化执行：
+
+```python
+import asyncio
+
+async def train_step(data, training_client, lr, num_substeps, loss_fn):
+    """流水线化训练步骤，最大化 GPU 利用率"""
+    batches = split_into_batches(data, num_substeps)
+
+    # 发送第一个 batch 的前向/反向传播
+    fb_future = training_client.forward_backward_async(
+        batches[0], loss=loss_fn
+    )
+
+    for i in range(1, len(batches)):
+        # 等待上一个 forward_backward 完成
+        await fb_future
+
+        # 同时发送 optim_step 和下一个 forward_backward
+        # 这两个操作可以在 GPU 上并行执行
+        os_future = training_client.optim_step_async(learning_rate=lr)
+        fb_future = training_client.forward_backward_async(
+            batches[i], loss=loss_fn
+        )
+
+        # 等待 optim_step 完成
+        await os_future
+
+    # 处理最后一个 batch
+    await fb_future
+    await training_client.optim_step_async(learning_rate=lr)
 ```
 
 ---
 
-## 3. 与其他热修复方案对比
+## 5. 支持的模型
 
-### 3.1 对比表
-
-| 特性 | Tinker | Sophix | Robust | AndFix |
-|------|--------|--------|--------|--------|
-| **开发团队** | 腾讯微信 | 阿里云 | 美团 | 阿里支付宝 |
-| **代码修复** | ✅ | ✅ | ✅ | ✅ |
-| **资源修复** | ✅ | ✅ | ❌ | ❌ |
-| **So 修复** | ✅ | ✅ | ❌ | ❌ |
-| **即时生效** | ❌ | ✅ (小修改) | ✅ | ✅ |
-| **修复粒度** | 类级别 | 方法/类级别 | 方法级别 | 方法级别 |
-| **侵入性** | 低 (依赖侵入) | 无 | 高 (插桩) | 无 |
-| **兼容性** | 优 | 优 | 优 | 差 |
-| **开源** | ✅ | ❌ | ✅ | ✅ (已停更) |
-| **费用** | 免费 | 商业收费 | 免费 | 免费 |
-| **维护状态** | 活跃 | 活跃 | 活跃 | 已停更 (2016) |
-| **补丁大小** | 小 | 小 | 较大 | 小 |
-| **平台支持** | 2.X~14+ | 4.0~14+ | 4.0~14+ | 2.3~7.0 |
-
-### 3.2 选型建议
-
-| 场景 | 推荐方案 |
-|------|---------|
-| 需要全面修复能力 + 免费 | **Tinker** |
-| 需要即时生效 + 简单集成 | **Sophix** (付费) |
-| 只修复代码 + 追求稳定 | **Robust** |
-| 不推荐 | AndFix (已停更) |
-
-### 3.3 各方案原理对比
-
-```
-┌─ 底层替换方案 ──────────────────────────────────┐
-│ AndFix: Native 层指针替换 ArtMethod             │
-│ Sophix: 整体替换 ArtMethod (改进版)              │
-│ 优点: 即时生效  缺点: 兼容性差, 修复范围受限      │
-└────────────────────────────────────────────────┘
-
-┌─ 类加载方案 ───────────────────────────────────┐
-│ Tinker: DexDiff + ClassLoader Hook              │
-│ QZone: 插桩 + ClassLoader Hook                  │
-│ 优点: 兼容性好, 修复范围广  缺点: 需要冷启动     │
-└────────────────────────────────────────────────┘
-
-┌─ Instant Run 方案 ─────────────────────────────┐
-│ Robust: 编译时插桩代理                           │
-│ 优点: 即时生效, 兼容性好  缺点: 包体积增大        │
-└────────────────────────────────────────────────┘
-
-┌─ 混合方案 ─────────────────────────────────────┐
-│ Sophix: 底层替换 + 类加载 自动选择               │
-│ 优点: 综合优势  缺点: 闭源, 商业收费              │
-└────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Tinker 组件模块
-
-### 4.1 核心模块
-
-| 模块 | 说明 |
+| 类别 | 模型 |
 |------|------|
-| `tinker-android-lib` | 核心 SDK，包含补丁加载和合成逻辑 |
-| `tinker-android-loader` | 补丁加载器，在应用启动最早期执行 |
-| `tinker-android-anno` | 注解处理器，自动生成 Application 类 |
-| `tinker-patch-gradle-plugin` | Gradle 插件，自动化补丁构建 |
-| `tinker-patch-cli` | 命令行工具，用于非 Gradle 环境 |
-| `tinker-commons` | 公共工具类 |
-| `aosp-dexutils` | AOSP dex 处理工具 |
-| `bsdiff-util` | BSDiff 差量算法工具 |
+| 紧凑模型 | Llama-3.2-1B, Llama-3.2-3B |
+| 中型模型 | Llama-3.1-8B, Qwen 系列 |
+| 大型模型 | Llama-3.1-70B |
+| MoE 大模型 | Qwen3-235B-A22B, Qwen3.5-397B-A17B |
+| 视觉语言模型 | Qwen3-VL |
 
-### 4.2 关键算法
+切换模型只需修改一个字符串：
 
-#### DexDiff 算法
+```python
+# 从 1B 切换到 70B，只需改 base_model 参数
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.1-70B",  # 只改这里
+    rank=32,
+)
+```
 
-Tinker 自研的 dex 差量算法，针对 dex 文件格式优化：
-
-- 基于 dex 文件内部结构（StringId、TypeId、MethodId、ClassDef 等 Section）逐段对比
-- 相比通用 BSDiff，针对 dex 格式优化后差量更小
-- 在微信实测中，补丁大小仅为 BSDiff 的 **1/5 到 1/10**
-
-#### BSDiff 算法
-
-用于 So 文件和大资源文件的差量计算：
-
-- 通用的二进制差量算法
-- 适合处理编译产物（so 文件等）的差量
+> **注意**：Tinker 不支持编码器模型（如 BERT、RoBERTa），仅支持自回归生成式模型。要做分类任务，需要将分类问题转化为生成式 prompt 格式（见第 6.3 节）。
 
 ---
 
-## 5. 已知限制
+## 6. 完整示例
 
-### 5.1 功能限制
+### 6.1 监督微调 (SFT)
 
-1. **不能修改 AndroidManifest.xml**：不能新增四大组件（Activity、Service、BroadcastReceiver、ContentProvider）
-   - 1.9.0+ 支持新增 **非导出（non-exported）Activity**
-2. **不支持即时生效**：需要冷启动后补丁才能生效
-3. **不支持修改 RemoteView 相关资源**：桌面小部件、通知栏图标等
-4. **Android N 轻微启动影响**：混合编译模式下有轻微的启动时间增加
+> 完整代码见 [examples/sft_training.py](../examples/sft_training.py)
 
-### 5.2 平台限制
+```python
+import tinker
 
-1. **Google Play 限制**：Google Play 开发者政策不推荐热修复
-2. **部分三星 Android 5.0 设备不兼容**
-3. **不支持 Instant Run**：开发时需关闭 Instant Run
+# 初始化
+service_client = tinker.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.2-1B",
+    rank=32,
+)
 
-### 5.3 开发限制
+# 准备训练数据
+train_data = [
+    [
+        {"role": "user", "content": "What is Python?"},
+        {"role": "assistant", "content": "Python is a high-level programming language."},
+    ],
+    [
+        {"role": "user", "content": "What is machine learning?"},
+        {"role": "assistant", "content": "Machine learning is a subset of AI."},
+    ],
+    # ... 更多数据
+]
 
-1. Application 类需要特殊处理（使用 ApplicationLike 代理）
-2. 多进程场景需要额外处理
-3. ProGuard 混淆需要保持 mapping 一致性
+# 训练循环
+num_epochs = 3
+learning_rate = 1e-4
+
+for epoch in range(num_epochs):
+    total_loss = 0.0
+
+    for messages in train_data:
+        # 前向 + 反向传播
+        result = training_client.forward_backward(
+            messages=messages,
+            loss="cross_entropy",
+        )
+        total_loss += result.loss
+
+        # 更新权重
+        training_client.optim_step(
+            learning_rate=learning_rate,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+        )
+
+    avg_loss = total_loss / len(train_data)
+    print(f"Epoch {epoch + 1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
+
+    # 保存检查点
+    training_client.save_state(f"checkpoint_epoch_{epoch + 1}")
+
+# 导出模型用于推理
+sampling_client = training_client.save_weights_and_get_sampling_client(
+    name="my_sft_model"
+)
+
+# 测试
+response = sampling_client.sample(
+    messages=[{"role": "user", "content": "What is deep learning?"}],
+    temperature=0.7,
+)
+print(response)
+```
+
+### 6.2 强化学习 (RL) 训练
+
+> 完整代码见 [examples/rl_training.py](../examples/rl_training.py)
+
+```python
+import tinker
+
+service_client = tinker.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.1-8B",
+    rank=64,
+)
+
+def reward_function(question, answer):
+    """自定义奖励函数 — 例如数学正确性检查"""
+    expected = eval_math(question)  # 获取正确答案
+    if expected in answer:
+        return 1.0  # 正确
+    return -0.5  # 错误
+
+# RL 训练循环
+questions = ["What is 15 * 23?", "What is 127 + 896?", ...]
+
+for step in range(1000):
+    question = questions[step % len(questions)]
+
+    # 用当前模型生成回答
+    sampling_client = training_client.save_weights_and_get_sampling_client(
+        name=f"step_{step}"
+    )
+    response = sampling_client.sample(
+        messages=[{"role": "user", "content": question}],
+        temperature=0.8,
+    )
+
+    # 计算奖励
+    reward = reward_function(question, response)
+
+    # 使用 policy gradient 损失进行训练
+    training_client.forward_backward(
+        messages=[
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": response},
+        ],
+        loss="policy_gradient",
+        reward=reward,
+    )
+
+    training_client.optim_step(learning_rate=5e-5)
+
+    if step % 100 == 0:
+        print(f"Step {step}, Reward: {reward}")
+        training_client.save_state(f"rl_checkpoint_{step}")
+```
+
+### 6.3 文本分类任务（以情感分类为例）
+
+> 完整代码见 [examples/text_classification.py](../examples/text_classification.py)
+
+虽然 Tinker 不支持传统编码器模型（BERT 等），但可以通过 **将分类问题转化为生成式 prompt** 的方式，用 LLM + SFT 实现高质量的文本分类。
+
+#### 核心思路
+
+```
+传统 BERT 分类:
+  输入 → BERT Encoder → [CLS] → 分类头 → softmax → 标签
+
+Tinker LLM 分类:
+  System Prompt + 输入 → LLM → 直接生成标签文本
+```
+
+#### 完整示例：情感分类
+
+```python
+import tinker
+import json
+import random
+
+# ============================================================
+# 1. 准备分类数据（将分类标签转化为 chat 格式）
+# ============================================================
+
+SYSTEM_PROMPT = """You are a sentiment classifier. Classify the given text into exactly one category.
+Respond with ONLY the label, nothing else.
+Labels: positive, negative, neutral"""
+
+# 训练数据：每条是一个 messages 列表
+train_data = [
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "This movie was absolutely fantastic! Best film I've seen all year."},
+        {"role": "assistant", "content": "positive"},
+    ],
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Terrible waste of time. The plot made no sense and the acting was awful."},
+        {"role": "assistant", "content": "negative"},
+    ],
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "The product arrived on time and works as described."},
+        {"role": "assistant", "content": "neutral"},
+    ],
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "I love this restaurant! The food is amazing and the service is excellent."},
+        {"role": "assistant", "content": "positive"},
+    ],
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Worst customer service ever. Never buying from them again."},
+        {"role": "assistant", "content": "negative"},
+    ],
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "The meeting has been rescheduled to 3pm tomorrow."},
+        {"role": "assistant", "content": "neutral"},
+    ],
+    # ... 更多标注数据（实际场景中建议 500+ 条）
+]
+
+# 测试数据
+test_data = [
+    {"text": "This is the best purchase I've ever made!", "label": "positive"},
+    {"text": "Completely disappointed with the quality.", "label": "negative"},
+    {"text": "The package weighs about 2 kilograms.", "label": "neutral"},
+    {"text": "Outstanding performance and great value for money!", "label": "positive"},
+    {"text": "The food was okay but nothing special.", "label": "neutral"},
+]
+
+# ============================================================
+# 2. 初始化 Tinker 训练客户端
+# ============================================================
+
+service_client = tinker.ServiceClient()
+training_client = service_client.create_lora_training_client(
+    base_model="meta-llama/Llama-3.2-1B",  # 分类任务用小模型即可
+    rank=16,  # 分类任务 LoRA 秩不需要太大
+)
+
+# ============================================================
+# 3. 训练循环
+# ============================================================
+
+num_epochs = 5
+learning_rate = 2e-4  # 分类任务可用稍大学习率
+
+for epoch in range(num_epochs):
+    random.shuffle(train_data)  # 每轮打乱数据
+    total_loss = 0.0
+
+    for messages in train_data:
+        result = training_client.forward_backward(
+            messages=messages,
+            loss="cross_entropy",
+        )
+        total_loss += result.loss
+
+        training_client.optim_step(
+            learning_rate=learning_rate,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+        )
+
+    avg_loss = total_loss / len(train_data)
+    print(f"Epoch {epoch + 1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
+
+    # 每轮保存检查点
+    training_client.save_state(f"sentiment_epoch_{epoch + 1}")
+
+# ============================================================
+# 4. 评估分类效果
+# ============================================================
+
+sampling_client = training_client.save_weights_and_get_sampling_client(
+    name="sentiment_classifier"
+)
+
+correct = 0
+total = len(test_data)
+
+for item in test_data:
+    response = sampling_client.sample(
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": item["text"]},
+        ],
+        temperature=0.0,  # 分类任务用 temperature=0 确保确定性输出
+        max_tokens=8,      # 标签很短，限制生成长度
+    )
+
+    predicted = response.strip().lower()
+    expected = item["label"]
+    is_correct = predicted == expected
+    correct += int(is_correct)
+
+    print(f"Text: {item['text'][:50]}...")
+    print(f"  Expected: {expected}, Predicted: {predicted} {'✓' if is_correct else '✗'}")
+
+accuracy = correct / total * 100
+print(f"\nAccuracy: {accuracy:.1f}% ({correct}/{total})")
+```
+
+#### 分类任务最佳实践
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `base_model` | Llama-3.2-1B 或 3B | 分类任务不需要大模型 |
+| `rank` | 8-32 | 分类任务复杂度低，小秩即可 |
+| `learning_rate` | 1e-4 ~ 5e-4 | 可以比生成任务稍大 |
+| `num_epochs` | 3-10 | 数据量少时多训几轮 |
+| `temperature` | 0.0 | 推理时用 0 确保确定性 |
+| `max_tokens` | 8-16 | 只生成标签，不需要长文本 |
+
+#### 适用的分类场景
+
+| 场景 | System Prompt 示例 | 标签示例 |
+|------|-------------------|---------|
+| **情感分析** | "Classify sentiment" | positive, negative, neutral |
+| **主题分类** | "Classify the topic" | sports, tech, politics, entertainment |
+| **意图识别** | "Identify the user intent" | question, complaint, request, feedback |
+| **垃圾邮件检测** | "Is this spam?" | spam, not_spam |
+| **毒性检测** | "Rate the toxicity" | toxic, non_toxic |
+| **新闻分类** | "Classify the news category" | business, science, health, world |
+
+### 6.4 多标签分类
+
+对于多标签分类场景（一条文本可能属于多个类别），调整 prompt 格式：
+
+```python
+MULTI_LABEL_PROMPT = """Classify the given text. A text can have MULTIPLE labels.
+Respond with applicable labels separated by commas, in alphabetical order.
+Labels: funny, informative, offensive, political, sarcastic"""
+
+train_data = [
+    [
+        {"role": "system", "content": MULTI_LABEL_PROMPT},
+        {"role": "user", "content": "The senator's tax plan is a joke - literally zero economists support it."},
+        {"role": "assistant", "content": "funny, political, sarcastic"},
+    ],
+    [
+        {"role": "system", "content": MULTI_LABEL_PROMPT},
+        {"role": "user", "content": "New study shows coffee may reduce risk of heart disease by 15%."},
+        {"role": "assistant", "content": "informative"},
+    ],
+    # ... 更多数据
+]
+```
 
 ---
 
-## 6. 生态系统
+## 7. Cookbook 示例项目
 
-### 6.1 TinkerPatch 补丁分发平台
+Tinker Cookbook 提供了多个生产级训练模板：
 
-[TinkerPatch](http://www.tinkerpatch.com) 是第三方提供的补丁分发管理平台：
-
-- 补丁 CDN 分发
-- 灰度发布
-- 补丁监控和统计
-- 条件下发（版本、渠道、设备等）
-
-### 6.2 社区与维护
-
-- GitHub Issues 活跃维护
-- Wiki 文档完善
-- 示例项目 `tinker-sample-android` 持续更新
+| 示例 | 描述 | 适用场景 |
+|------|------|---------|
+| **Chat SFT** | 对话式监督微调 | 聊天机器人定制 |
+| **Math Reasoning** | 数学推理 RL 训练 | 提升数学能力 |
+| **Preference Learning** | 三阶段 RLHF (SFT→RM→PPO) | 对齐训练 |
+| **Tool Use** | 工具调用检索增强训练 | 智能体训练 |
+| **Prompt Distillation** | 大模型行为蒸馏 | 模型压缩 |
+| **Multi-Agent** | 多智能体优化 | 多模型协作 |
 
 ---
 
-## 7. 总结
+## 8. 知名用户与成果
 
-Tinker 是目前 Android 开源热修复领域功能最全面、稳定性最高的方案。虽然需要冷启动才能生效，但其全面的修复能力（代码+资源+So）、出色的兼容性和极小的补丁体积，使其成为大多数 Android 应用热修复的首选。
+| 团队 | 应用 | 成果 |
+|------|------|------|
+| Princeton Goedel | 形式化定理证明 | 用 LoRA 仅 20% 数据达到全参微调效果 (88.1% pass@32 on MiniF2F) |
+| Stanford Rotskoff Lab | 化学推理 (LLaMA 70B) | IUPAC 转化学式准确率从 15% 提升到 50% |
+| Berkeley | 早期采用者 | — |
+| Redwood Research | 早期采用者 | — |
 
-对于有预算的团队，可以考虑阿里的 Sophix 作为替代方案，它在即时生效和易用性方面更有优势，但需要商业付费。
+---
 
-对于只需要修复代码层面 bug 且要求即时生效的场景，美团的 Robust 是不错的选择。
+## 9. 数据隐私与定价
+
+- **数据隐私**：用户数据仅用于训练用户自己的模型，Thinking Machines 不使用客户数据训练自有模型
+- **定价**：按百万 token 计费（基于计算量）
+- **推理兼容**：训练后的模型暴露 OpenAI 兼容 HTTP 端点，可使用任何 OpenAI SDK 调用
+
+---
+
+## 10. 已知限制
+
+1. **仅支持自回归生成模型**：不支持 BERT、RoBERTa 等编码器模型
+2. **仅 LoRA 微调**：不支持全参数微调（团队认为 LoRA 已足够）
+3. **需要网络连接**：所有计算在云端执行，离线无法使用
+4. **API 延迟**：每次 `forward_backward` 调用都有网络往返延迟
+5. **模型范围**：目前仅支持 Llama 和 Qwen 系列，不支持其他架构
+
+---
+
+## 11. 总结
+
+Thinking Machines Tinker 代表了 LLM 训练基础设施的新范式：
+
+- **极简 API**：4 个核心原语覆盖所有训练需求
+- **零基础设施管理**：不需要管理 GPU、NCCL、分布式策略
+- **完整算法控制**：研究者保留对训练循环、损失函数、优化器的完全控制
+- **适合研究者**：特别适合 RL 研究、对齐训练等需要精细控制的场景
+- **分类任务可行**：虽然不支持 BERT，但通过 prompt 转化可以高效完成文本分类
+
+与传统 MLOps 平台（如 AWS SageMaker、Modal）相比，Tinker 的定位更偏向"研究者工具"而非"工程师平台"。
+
+---
+
+## 参考资源
+
+- [Tinker 官网](https://thinkingmachines.ai/tinker/)
+- [Tinker 文档](https://tinker-docs.thinkingmachines.ai/)
+- [Tinker SDK GitHub](https://github.com/thinking-machines-lab/tinker)
+- [Tinker Cookbook GitHub](https://github.com/thinking-machines-lab/tinker-cookbook)
