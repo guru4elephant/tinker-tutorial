@@ -22,6 +22,7 @@ Thinking Machines Tinker 是由 Thinking Machines Lab（Mira Murati & John Schul
 - [全面调研报告](docs/research-report.md) — 架构原理、核心 API、与其他平台对比、完整使用教程
 - [On-Policy Distillation 调研](docs/on-policy-distillation.md) — 在策略蒸馏原理、逆向 KL 散度、Cookbook 实战
 - [Agentic RL 多轮工具调用](docs/agentic-rl-tool-use.md) — Env 接口、多轮训练、GRPO、Cookbook 实战案例
+- [多模态 VLM RL 训练](docs/vlm-rl-training.md) — Qwen3-VL 视觉模型微调、ImageChunk API、模型列表说明
 
 ### 示例代码
 
@@ -30,6 +31,7 @@ Thinking Machines Tinker 是由 Thinking Machines Lab（Mira Murati & John Schul
 - [强化学习 (RL)](examples/rl_training.py) — Policy Gradient + 自定义奖励函数
 - [On-Policy Distillation](examples/on_policy_distillation.py) — 大模型蒸馏到小模型（逆向 KL 散度）
 - [Agentic RL 工具调用](examples/agentic_rl_tool_use.py) — 多轮 RL 训练 agent 使用工具（GRPO 风格）
+- [VLM RL 训练](examples/vlm_rl_training.py) — 视觉语言模型 RL 微调（图表推理 + GRPO）
 
 ## 快速开始
 
@@ -96,6 +98,9 @@ print(response)
 | Agentic RL 工具调用 | 多轮 RL 训练 agent 使用检索/计算/终端工具 |
 | 模型蒸馏 | 大模型行为蒸馏到小模型 |
 | On-Policy Distillation | 学生 on-policy 采样 + 教师 KL 监督（FLOPs 降低 9-30x） |
+| 多模态视觉 RL | VLM 图表推理、GUI Agent、视觉数学（Qwen3-VL） |
+
+> **注意**：Tinker 只支持[预定义的模型列表](https://tinker-docs.thinkingmachines.ai/model-lineup)，不支持上传自定义模型。训练好的 LoRA 权重可下载导出。
 
 ## 参考资源
 
@@ -104,3 +109,4 @@ print(response)
 - [Tinker SDK GitHub](https://github.com/thinking-machines-lab/tinker)
 - [Tinker Cookbook GitHub](https://github.com/thinking-machines-lab/tinker-cookbook)
 - [On-Policy Distillation Blog](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Tinker GA + Vision Input Blog](https://thinkingmachines.ai/blog/tinker-general-availability/)
