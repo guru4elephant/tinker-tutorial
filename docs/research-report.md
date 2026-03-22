@@ -87,24 +87,75 @@ Tinker 采用 **类加载方案 (ClassLoader)**，而非底层替换方案：
 新 APK (new.apk)  ─┘
 ```
 
-#### 2.2.2 补丁加载（运行时）
+**DexDiff 内部实现：** `DexPatchGenerator` 是入口类，它为 DEX 文件的每个 Section 初始化独立的 Diff 算法：
 
-1. 应用启动时，TinkerLoader 检查是否有可用补丁
-2. 使用 DexPatch 将差量补丁与旧 dex **合成** 为新的完整 dex
-3. 通过反射 **Hook ClassLoader 的 dexElements 数组**，将合成后的 dex 插入到最前面
-4. 后续类加载时优先从补丁 dex 中加载，实现代码替换
+| Section Diff 算法 | 处理的 DEX Section |
+|---|---|
+| `StringDataSectionDiffAlgorithm` | 字符串常量池 |
+| `TypeIdSectionDiffAlgorithm` | 类型 ID 表 |
+| `ProtoIdSectionDiffAlgorithm` | 方法原型表 |
+| `FieldIdSectionDiffAlgorithm` | 字段 ID 表 |
+| `MethodIdSectionDiffAlgorithm` | 方法 ID 表 |
+| `ClassDefSectionDiffAlgorithm` | 类定义表 |
+| `TypeListSectionDiffAlgorithm` | 类型列表 |
+| `AnnotationSetSectionDiffAlgorithm` | 注解集 |
+| `ClassDataSectionDiffAlgorithm` | 类数据（字段/方法列表） |
+| `CodeSectionDiffAlgorithm` | 字节码指令 |
+| `DebugInfoItemSectionDiffAlgorithm` | 调试信息 |
+
+生成的补丁文件包含：MAGIC 头、版本号、各 Section 的操作列表（删除、新增、替换），每个操作记录目标索引和数据。
 
 ```java
-// 原理简化示意
-// Android ClassLoader 加载类时遍历 dexElements 数组
-// Tinker 将合成后的 dex 插到数组最前面
-DexPathList.dexElements = [patchedDex, originalDex1, originalDex2, ...]
-// 类查找时先在 patchedDex 中找到修复后的类
+// DexDiff 使用示意
+DexPatchGenerator generator = new DexPatchGenerator(oldDexFile, newDexFile);
+generator.executeAndSaveTo(patchFile);
+```
+
+#### 2.2.2 补丁加载（运行时）
+
+补丁加载分为两个阶段：**合成阶段**（后台进程）和**加载阶段**（主进程重启后）。
+
+**合成阶段：**
+1. `TinkerInstaller.onReceiveUpgradePatch()` 触发补丁请求
+2. 请求经过 `PatchListener` 验证（签名、空间、版本等）
+3. 在独立的 `:patch` 进程中，`TinkerPatchService` 执行 DexPatch 合成
+4. 合成后的完整 dex 写入应用数据目录
+5. `ResultService` 回调通知合成结果
+
+**加载阶段（下次冷启动）：**
+1. `TinkerApplication.onCreate()` 最先执行
+2. `TinkerLoader.tryLoad()` 检查是否有已合成的补丁
+3. 使用 ClassLoader 注入机制加载合成后的 dex
+
+**Tinker 提供两种 ClassLoader 注入方式：**
+
+| 方式 | 类名 | 原理 | 适用场景 |
+|------|------|------|---------|
+| **方式 A（默认）** | `NewClassLoaderInjector` | 创建新的 `TinkerClassLoader`，通过反射替换 `LoadedApk.mClassLoader` | 新版本推荐 |
+| **方式 B（Legacy）** | `SystemClassLoaderAdder` | 反射修改现有 `PathClassLoader` 的 `dexElements` 数组 | 旧版本兼容 |
+
+```java
+// 方式 A 原理简化示意
+// 创建包含合成 dex 的新 ClassLoader
+TinkerClassLoader newLoader = new TinkerClassLoader(mergedDexPath, parent);
+// 反射替换 LoadedApk 的 mClassLoader
+LoadedApk loadedApk = getLoadedApk();
+Field classLoaderField = loadedApk.getClass().getDeclaredField("mClassLoader");
+classLoaderField.set(loadedApk, newLoader);
 ```
 
 > **注意**：Tinker 的类加载方案需要 **冷启动（重启应用）** 后才能生效，不支持即时生效。
 
-#### 2.2.3 为什么选择类加载方案？
+#### 2.2.3 崩溃保护机制
+
+Tinker 内置了崩溃保护，防止坏补丁导致应用无限崩溃：
+
+1. 每次加载补丁后启动，Tinker 在 SharedPreferences 中递增崩溃计数器
+2. 如果应用在启动后 **10 秒内** 连续崩溃超过 **3 次**，判定为补丁导致的崩溃
+3. 自动 **回滚补丁**（`cleanPatch`），恢复到基线版本
+4. 成功运行超过阈值时间后，重置崩溃计数器
+
+#### 2.2.4 为什么选择类加载方案？
 
 | 特性 | 底层替换 (AndFix) | 类加载 (Tinker) |
 |------|-------------------|-----------------|
